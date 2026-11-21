@@ -1,7 +1,10 @@
-"""Compare two loop orders for BERT-Tiny layer 0's second FFN matmul.
+"""Compare matmul loop orders in BERT-Tiny's layer 0 FFN.
 
 Run from the project root, with bench_bert_ffn.py alongside this script.
+Default: original vs. second matmul reordered.
+--first: second matmul reordered vs. both matmuls reordered.
 """
+import argparse
 import math
 import re
 import subprocess
@@ -14,18 +17,22 @@ import numpy as np
 import bench_bert_ffn as bench
 
 
-def interchange_second_matmul(source):
+def interchange_matmul(source, projection):
+    k, n = {"mm1": (128, 512), "mm2": (512, 128)}[projection]
+    lhs_type = f"tensor<64x{k}xf32>"
+    rhs_type = f"tensor<{k}x{n}xf32>"
+    out_type = f"tensor<64x{n}xf32>"
     ssa = r"%[\w.$-]+"
     pattern = re.compile(
         rf"^(?P<indent>[ \t]*)(?P<result>{ssa}) = linalg\.matmul\s+"
         rf"ins\(\s*(?P<lhs>{ssa}),\s*(?P<rhs>{ssa})\s*:\s*"
-        r"tensor<64x512xf32>,\s*tensor<512x128xf32>\)\s+"
-        rf"outs\(\s*(?P<init>{ssa})\s*:\s*tensor<64x128xf32>\)\s*"
-        r"->\s*tensor<64x128xf32>", re.MULTILINE,
+        rf"{lhs_type},\s*{rhs_type}\)\s+"
+        rf"outs\(\s*(?P<init>{ssa})\s*:\s*{out_type}\)\s*"
+        rf"->\s*{out_type}", re.MULTILINE,
     )
     matches = list(pattern.finditer(source))
     if len(matches) != 1:
-        raise ValueError(f"Expected one 64x512 by 512x128 matmul, found {len(matches)}")
+        raise ValueError(f"Expected one {lhs_type} by {rhs_type} matmul, found {len(matches)}")
     match = matches[0]
     indent, result, lhs, rhs, init = match.groups()
     # d0 is token i, d1 is reduction k, and d2 is output feature j.
@@ -35,16 +42,20 @@ def interchange_second_matmul(source):
         "                   affine_map<(d0, d1, d2) -> (d1, d2)>,",
         "                   affine_map<(d0, d1, d2) -> (d0, d2)>],",
         '  iterator_types = ["parallel", "reduction", "parallel"]',
-        f"}} ins({lhs}, {rhs} : tensor<64x512xf32>, tensor<512x128xf32>)",
-        f"  outs({init} : tensor<64x128xf32>) {{",
-        "^bb0(%mm2_a: f32, %mm2_b: f32, %mm2_acc: f32):",
-        "  %mm2_product = arith.mulf %mm2_a, %mm2_b : f32",
-        "  %mm2_sum = arith.addf %mm2_acc, %mm2_product : f32",
-        "  linalg.yield %mm2_sum : f32",
-        "} -> tensor<64x128xf32>",
+        f"}} ins({lhs}, {rhs} : {lhs_type}, {rhs_type})",
+        f"  outs({init} : {out_type}) {{",
+        f"^bb0(%{projection}_a: f32, %{projection}_b: f32, %{projection}_acc: f32):",
+        f"  %{projection}_product = arith.mulf %{projection}_a, %{projection}_b : f32",
+        f"  %{projection}_sum = arith.addf %{projection}_acc, %{projection}_product : f32",
+        f"  linalg.yield %{projection}_sum : f32",
+        f"}} -> {out_type}",
     ]
     replacement = "\n".join(indent + line for line in lines)
     return source[:match.start()] + replacement + source[match.end():]
+
+
+def interchange_second_matmul(source):
+    return interchange_matmul(source, "mm2")
 
 
 def matmul_bounds(ir):
@@ -68,7 +79,7 @@ def matmul_bounds(ir):
     return nests
 
 
-def inspect_loops(source, expected):
+def inspect_loops(source, expected, *, first_expected=("64", "512", "128")):
     # Canonicalize this inspection copy to expose literal bounds. Timing uses
     # the unmodified benchmark pipeline on the original tensor-level source.
     passes = bench.PASSES[:bench.PASSES.index("--convert-linalg-to-loops") + 1]
@@ -79,8 +90,9 @@ def inspect_loops(source, expected):
     if len(nests) != 2:
         print(f"Could not identify both static matmul nests. Inspect {scf}", flush=True)
         return
-    print(f"{source.name}: second matmul loop bounds {' -> '.join(nests[1])}", flush=True)
-    if nests != [("64", "512", "128"), expected]:
+    print(f"{source.name}: first {' -> '.join(nests[0])}, second {' -> '.join(nests[1])}",
+          flush=True)
+    if nests != [first_expected, expected]:
         raise ValueError(f"Unexpected loop order in {scf}: {nests}")
 
 
@@ -114,17 +126,32 @@ def compare(directory, sources):
             timings[name].append(ms)
             print(f"{name} run {trial + 1}: {ms:.4f} ms/call", flush=True)
 
-    original, ikj = median(timings["original"]), median(timings["ikj"])
-    print(f"Median original: {original:.4f} ms/call")
-    print(f"Median ikj:      {ikj:.4f} ms/call")
-    print(f"Speedup (original/ikj): {original / ikj:.3f}x")
+    baseline, candidate = sources
+    baseline_ms = median(timings[baseline])
+    candidate_ms = median(timings[candidate])
+    print(f"Median {baseline}: {baseline_ms:.4f} ms/call")
+    print(f"Median {candidate}: {candidate_ms:.4f} ms/call")
+    print(f"Speedup ({baseline}/{candidate}): {baseline_ms / candidate_ms:.3f}x")
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--first", action="store_true",
+                        help="measure reordering the first matmul with the second already reordered")
+    args = parser.parse_args()
     original = bench.SOURCES["original"]
     ikj = bench.BUILD / "bert-tiny-layer0-ffn-mm2-ikj.mlir"
-    ikj.write_text(interchange_second_matmul(original.read_text()))
-    inspect_loops(original, ("64", "128", "512"))
-    inspect_loops(ikj, ("64", "512", "128"))
+    second_only = interchange_second_matmul(original.read_text())
+    ikj.write_text(second_only)
+    if args.first:
+        both = bench.BUILD / "bert-tiny-layer0-ffn-both-ikj.mlir"
+        both.write_text(interchange_matmul(second_only, "mm1"))
+        inspect_loops(ikj, ("64", "512", "128"))
+        inspect_loops(both, ("64", "512", "128"), first_expected=("64", "128", "512"))
+        sources = {"second-only": ikj, "both": both}
+    else:
+        inspect_loops(original, ("64", "128", "512"))
+        inspect_loops(ikj, ("64", "512", "128"))
+        sources = {"original": original, "ikj": ikj}
     with tempfile.TemporaryDirectory(prefix="bert-mm2-") as temp:
-        compare(Path(temp), {"original": original, "ikj": ikj})
+        compare(Path(temp), sources)
