@@ -1,0 +1,1 @@
+Reordered four FFN matrix multiplications in BERT-Tiny using MLIR. At batch size 1 and sequence length 64, median CPU inference time fell from 23.03 ms to 10.05 ms (2.29× speedup). All 8,192 outputs matched PyTorch within tolerance on the test input.
