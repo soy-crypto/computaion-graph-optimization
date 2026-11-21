@@ -15,10 +15,14 @@ args = (inputs["input_ids"], inputs["attention_mask"], inputs["token_type_ids"])
 
 with torch.no_grad():
     expected = model.forward(*args)[0]
+    emb = model.embeddings
+    emb.register_buffer("position_ids", emb.position_ids, persistent=True)
+    emb.register_buffer("token_type_ids", emb.token_type_ids, persistent=True)
     program = torch.export.export(model, args)
     exported_model = program.module()
     actual = exported_model.forward(*args)[0]
 
+assert "embeddings.position_ids" in program.state_dict
 assert expected.shape == (1, 64, 128)
 torch.testing.assert_close(actual, expected)
 print("Outputs match for this input.", tuple(actual.shape))
